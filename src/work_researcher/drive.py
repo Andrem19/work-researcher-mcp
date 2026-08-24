@@ -61,7 +61,9 @@ def build_service(settings: Settings):
 
             creds = Credentials.from_authorized_user_file(str(token), SCOPES)
             if creds.expired and creds.refresh_token:
-                creds.refresh(None)
+                from google.auth.transport.requests import Request
+
+                creds.refresh(Request())
         elif client.exists():
             raise DriveNotConfigured(
                 f"OAuth token missing ({token}). Run: work-researcher drive-auth"
