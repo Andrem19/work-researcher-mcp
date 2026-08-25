@@ -112,6 +112,11 @@ _FORM_JS = r"""
 
 _MODAL_TAGGER_JS = r"""
 () => {
+  // Modal element numbers must be the only active namespace. Without clearing
+  // the background page, browser_set(0) can resolve the first page field with
+  // data-wr-n="0" instead of the modal control the agent just observed.
+  document.querySelectorAll('[data-wr-n]').forEach(
+    el => el.removeAttribute('data-wr-n'));
   const dialogs = Array.from(document.querySelectorAll(
     '[role="dialog"], [role="alertdialog"], .modal.show, [aria-modal="true"]'));
   // keep only the truly visible dialog (hidden templates like
@@ -172,6 +177,7 @@ class BrowserSession:
         self._page = None
         self._lock = asyncio.Lock()
         self._last_click = 0.0  # popups are adopted only right after a click
+        self._trace_path: Path | None = None
 
     @property
     def running(self) -> bool:
@@ -235,6 +241,15 @@ class BrowserSession:
             self._context.set_default_timeout(
                 int(self.settings.browser.get("default_timeout_ms", 15000))
             )
+            configured_trace = str(self.settings.browser.get("trace_path", "")).strip()
+            if configured_trace:
+                self._trace_path = Path(configured_trace)
+                self._trace_path.parent.mkdir(parents=True, exist_ok=True)
+                await self._context.tracing.start(
+                    screenshots=True,
+                    snapshots=True,
+                    sources=True,
+                )
             self._context.on("page", self._on_popup)
             # Edge restores tabs from the previous run in a persistent
             # profile — keep one clean page and close the leftovers, so
@@ -835,13 +850,19 @@ class BrowserSession:
         async with self._lock:
             try:
                 if self._context:
+                    if self._trace_path is not None:
+                        await self._context.tracing.stop(path=str(self._trace_path))
                     await self._context.close()
             finally:
                 self._context, self._page = None, None
                 if self._pw:
                     await self._pw.stop()
                     self._pw = None
-        return {"closed": True, "at": time.time()}
+        return {
+            "closed": True,
+            "at": time.time(),
+            "playwright_trace": str(self._trace_path) if self._trace_path else None,
+        }
 
 
 _SESSIONS: dict[str, BrowserSession] = {}

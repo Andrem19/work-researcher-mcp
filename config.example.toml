@@ -15,7 +15,7 @@ default_work_from_home = false
 default_limit_per_source = 25
 provider_timeout_s = 30
 # Drop paid training/course ads automatically (where the candidate PAYS for
-# "training" — Netcom-style marketing). Real paid apprenticeships stay.
+# "training" — course marketing dressed as jobs). Real paid apprenticeships stay.
 exclude_training_offers = true
 
 # Saved searches: used as search_jobs(profile="..."), extendable in chat.
@@ -37,31 +37,30 @@ email = ""
 phone = ""
 # Wizard answers — boards (Reed/Totaljobs apply flows) ask for these:
 date_of_birth = ""                # "YYYY-MM-DD" — required by application wizards
-nationality = "British"
+nationality = ""
 right_to_work = "Yes, I have the right to work in the UK"
-right_to_work_docs = "UK birth certificate"   # or "UK passport", "settled status"
-uk_residence_years = "10+"        # "lived in UK/EU/EEA 3+ years" question
-age_group = ""                    # e.g. "35-39" (wizard dropdowns)
-gender = "Male"                   # Reed wizard Q5
-ethnicity = "White"               # Reed wizard Q6 (UK census groups)
-still_in_education = false        # Reed wizard Q7
+right_to_work_docs = ""           # e.g. "UK passport", "UK birth certificate"
+uk_residence_years = ""           # "lived in UK/EU/EEA 3+ years" question
+age_group = ""                    # e.g. "25-29" (wizard dropdowns)
+gender = ""
+ethnicity = ""
+still_in_education = false
 earliest_start_date = ""          # blank = ~2 Mondays ahead
-highest_qualification = "Level 6 (BSc degree, NARIC confirmed)"
+highest_qualification = ""
 past_apprenticeship = false
-owns_car = true
+owns_car = false
 # Location intelligence: remote jobs are searched UK-wide automatically;
 # on_site jobs must be within daily_commute_miles; hybrid/field/unknown
 # within occasional_commute_miles. Mismatch jobs are dropped from results
 # (drop_mismatch, configurable per search).
-home_location = "Blackpool"
-home_postcode = ""                 # optional, improves accuracy (e.g. "FY1 1AA")
-max_commute_miles = 40             # legacy fallback when work_mode unknown
+home_location = ""                # e.g. "Manchester"
+home_postcode = ""                # optional, improves accuracy
+max_commute_miles = 40            # legacy fallback
 daily_commute_miles = 25          # on-site (daily office) commute limit
-occasional_commute_miles = 50      # hybrid/field (1-2 days/week) limit
+occasional_commute_miles = 50     # hybrid/field (1-2 days/week) limit
 willing_to_relocate = false
-relocate_areas = []                # e.g. ["Manchester", "Leeds"]
-location = "Blackpool, UK"
-right_to_work = "Yes, I have the right to work in the UK"
+relocate_areas = []               # e.g. ["Leeds", "Birmingham"]
+location = ""
 notice_period = ""
 salary_expectation = ""
 linkedin = ""
@@ -69,12 +68,23 @@ linkedin = ""
 [drive]
 enabled = true
 mode = "oauth"                     # oauth | service_account | off
-account = "ry4ara@gmail.com"
-folder_name = "CV"
+account = ""                       # your Google account (informational)
+folder_name = "CV"                 # the Drive folder holding your CVs
 folder_id = ""                     # optional: paste the Drive folder id to skip lookup
 credentials_file = "secrets/google_credentials.json"
 token_file = "secrets/google_token.json"
 service_account_file = "secrets/google_service_account.json"
+
+[auth]
+# Pre-approved by you: the agent may click "Sign in with Google" and pick
+# this account on job boards WITHOUT asking permission (2FA/captcha → ask).
+google_account = ""
+auto_google_signin = true
+
+[blocklist]
+# Seeded into the DB on first use; runtime additions persist in the DB via
+# the manage_blocklist MCP tool ("never apply to X" → add company X here too).
+companies = []
 
 [browser]
 headless = false                   # headed: user can step in for 2FA/captcha;
@@ -82,19 +92,6 @@ headless = false                   # headed: user can step in for 2FA/captcha;
 channel = "msedge"                 # real Edge: passes Windows App Control and
                                    # anti-bot; auto-falls back to bundled Chromium
 default_timeout_ms = 15000
-
-[auth]
-# Pre-approved by the user: the agent may click "Sign in with Google" and pick
-# this account on job boards WITHOUT asking permission (2FA/captcha → ask).
-google_account = "7255591@gmail.com"
-auto_google_signin = true
-
-[blocklist]
-# Seeded into the DB on first use; runtime additions persist in the DB via
-# the manage_blocklist MCP tool ("never apply to X" → add company X here too).
-companies = [
-    # "Penguin Recruitment",
-]
 
 [providers.totaljobs]
 enabled = true
@@ -117,5 +114,5 @@ enabled = true
 uk_only = true
 
 [providers.findajob]
-enabled = true                  # GOV.UK Work Hub (jobs.service.gov.uk/jobs)
-browser_only = true             # JS SPA — searched via browser, not HTTP
+enabled = true                     # GOV.UK Work Hub (jobs.service.gov.uk/jobs)
+browser_only = true                # JS SPA — searched via browser, not HTTP
