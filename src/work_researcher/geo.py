@@ -5,7 +5,7 @@ Rules the agent relies on:
 - hybrid / on-site / field jobs: must be within max_commute_miles of home
   (or explicitly relocatable), otherwise flagged location_status=mismatch
   and heavily penalised in ranking;
-- the user lives in Blackpool today; home/relocate settings live in
+- each candidate's home/relocate settings live in the active profile's
   config.toml [applicant] and can change any time.
 
 Geocoding: postcodes.io (free, no key) — places endpoint for town/city
@@ -16,7 +16,6 @@ in the locations table; unknown places degrade to location_status=unknown
 
 from __future__ import annotations
 
-import asyncio
 import math
 import re
 

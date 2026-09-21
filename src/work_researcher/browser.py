@@ -10,14 +10,15 @@ Design rules (why this is fast for an agent):
    browser_find() to locate, browser_form() for application forms.
 3. Popups/new tabs opened by an action are adopted automatically (job boards
    love target="_blank"), with browser_tabs to navigate between them.
-4. Persistent profile (data/browser_profile) keeps board logins between runs.
+4. A per-candidate persistent profile keeps board logins between runs without
+   sharing authenticated sessions across candidates.
    Headed by default — the user can step in for 2FA/captcha.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
+import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -273,12 +274,15 @@ class BrowserSession:
 
         profile = str(self.settings.browser_profile_dir)
         try:
+            process_env = os.environ.copy()
+            process_env["WORK_RESEARCHER_BROWSER_PROFILE"] = profile
             out = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
+                 "$wrProfile = $env:WORK_RESEARCHER_BROWSER_PROFILE; "
                  "Get-CimInstance Win32_Process | Where-Object { "
-                 "$_.CommandLine -like '*browser_profile*' } | "
+                 "$_.CommandLine -like ('*' + $wrProfile + '*') } | "
                  "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"],
-                capture_output=True, timeout=15)
+                capture_output=True, timeout=15, env=process_env)
             _ = out  # best-effort
         except Exception:  # noqa: BLE001 - never block the launch
             pass
@@ -873,3 +877,12 @@ def get_session(settings: Settings) -> BrowserSession:
     if key not in _SESSIONS:
         _SESSIONS[key] = BrowserSession(settings)
     return _SESSIONS[key]
+
+
+async def close_profile_session(settings: Settings) -> dict:
+    """Close and forget the active profile's browser before profile switching."""
+    key = str(settings.db_path)
+    session = _SESSIONS.pop(key, None)
+    if session is None:
+        return {"closed": False, "reason": "not_started"}
+    return await session.close()

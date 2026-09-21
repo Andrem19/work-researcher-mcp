@@ -1,6 +1,6 @@
 """Command-line interface.
 
-Commands: serve, doctor, search, index-cvs, drive-auth, drive-sync, selftest.
+Commands: serve, doctor, search, index-cvs, profiles, use-profile, selftest.
 Logs never go to stdout in serve mode (stdout is the MCP protocol stream).
 """
 
@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import json
 import sys
+from pathlib import Path
 
 
 def _print(obj) -> None:
@@ -20,29 +21,38 @@ def _print(obj) -> None:
 
 
 async def cmd_serve(args) -> int:
+    from .config import load_settings
     from .server import run_stdio
 
     if args.transport != "stdio":
         print(f"Unsupported transport: {args.transport}", file=sys.stderr)
         return 2
-    await run_stdio()
+    await run_stdio(load_settings(profile=args.profile))
     return 0
 
 
 async def cmd_doctor(args) -> int:
-    from . import drive as drive_mod
     from . import persistence as db
     from .config import ensure_dirs, load_settings
 
     settings = load_settings()
     ensure_dirs(settings)
     await db.init_db(settings.db_path)
-    report: dict = {"database": str(settings.db_path), "cv_dir": str(settings.cv_dir)}
+    report: dict = {
+        "active_profile": settings.profile_id,
+        "profile_name": settings.profile_name,
+        "database": str(settings.db_path),
+        "cv_dir": str(settings.cv_dir),
+    }
     async with db.connect(settings.db_path) as conn:
         report["jobs"] = await db.count_rows(conn, "jobs")
         report["applications"] = await db.count_rows(conn, "applications")
         report["cvs"] = await db.count_rows(conn, "cvs")
-    report["drive"] = await drive_mod.status(settings)
+    report["cv_storage"] = {
+        "mode": "local_manual",
+        "directory": str(settings.cv_dir),
+        "instruction": "Copy CV files here and run work-researcher index-cvs",
+    }
     for name in ("totaljobs", "reed", "adzuna", "jooble", "earthworks", "findajob"):
         report[f"provider.{name}"] = {
             "enabled": settings.provider_enabled(name),
@@ -74,7 +84,6 @@ async def cmd_search(args) -> int:
     from . import dedup as dedup_mod
     from . import persistence as db
     from .ranking import score_job
-    from .textutils import job_hash
 
     params = SearchParams(
         query=args.query, location=args.location or settings.default_location,
@@ -119,31 +128,6 @@ async def cmd_index_cvs(args) -> int:
     return 0
 
 
-async def cmd_drive_auth(args) -> int:
-    from .config import load_settings
-    from .drive import run_oauth_flow
-
-    settings = load_settings()
-    try:
-        token = run_oauth_flow(settings)
-        print(f"OAuth token saved: {token}")
-        print("Run 'work-researcher drive-sync' to pull the CV folder.")
-        return 0
-    except Exception as exc:  # noqa: BLE001
-        print(f"OAuth flow failed: {exc}", file=sys.stderr)
-        return 1
-
-
-async def cmd_drive_sync(args) -> int:
-    from .config import ensure_dirs, load_settings
-    from .drive import sync
-
-    settings = load_settings()
-    ensure_dirs(settings)
-    _print(await sync(settings))
-    return 0
-
-
 async def cmd_selftest(args) -> int:
     """In-process smoke test of every tool layer (no MCP client needed)."""
     from .config import ensure_dirs, load_settings
@@ -151,8 +135,6 @@ async def cmd_selftest(args) -> int:
     settings = load_settings()
     ensure_dirs(settings)
     results: dict[str, str] = {}
-
-    import aiosqlite
 
     from . import persistence as db
 
@@ -213,7 +195,7 @@ async def cmd_selftest(args) -> int:
     # cv manager (no files → zero is fine)
     from .cvmanager import index_cvs
 
-    idx = await index_cvs(settings)
+    idx = await index_cvs(settings, prune_missing=False)
     results["cv_index"] = f"found={idx['files_found']} indexed={idx['indexed']}"
 
     # browser import only (no window in selftest)
@@ -233,6 +215,39 @@ async def cmd_selftest(args) -> int:
     return 0
 
 
+async def cmd_profiles(args) -> int:
+    from .config import load_settings
+
+    settings = load_settings()
+    _print({
+        "active_profile": settings.profile_id,
+        "active_display_name": settings.profile_name,
+        "active_instructions": settings.profile_instructions or None,
+        "profiles": settings.available_profiles,
+    })
+    return 0
+
+
+async def cmd_use_profile(args) -> int:
+    from .config import CONFIG_PATH, set_active_profile
+
+    try:
+        settings = set_active_profile(
+            Path(args.config) if args.config else CONFIG_PATH,
+            args.profile,
+        )
+    except (OSError, RuntimeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    _print({
+        "ok": True,
+        "active_profile": settings.profile_id,
+        "display_name": settings.profile_name,
+        "note": "restart any already-running MCP process; manage_profiles switches it live",
+    })
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="work-researcher",
                                 description="UK job search & application MCP")
@@ -240,6 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("serve", help="Run the MCP server")
     sp.add_argument("--transport", default="stdio", choices=["stdio"])
+    sp.add_argument("--profile", default=None, help="Candidate profile for this process")
     sp.set_defaults(func=cmd_serve)
 
     sub.add_parser("doctor", help="Config/DB/provider report").set_defaults(func=cmd_doctor)
@@ -252,17 +268,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--top", type=int, default=15)
     sp.set_defaults(func=cmd_search)
 
-    sp = sub.add_parser("index-cvs", help="Scan CV_collection into the index")
+    sp = sub.add_parser("index-cvs", help="Scan the active profile's CV directory")
     sp.add_argument("--force", action="store_true")
     sp.set_defaults(func=cmd_index_cvs)
 
-    sub.add_parser("drive-auth", help="Run the Google OAuth consent flow once") \
-        .set_defaults(func=cmd_drive_auth)
-
-    sub.add_parser("drive-sync", help="Pull CVs from Google Drive") \
-        .set_defaults(func=cmd_drive_sync)
-
     sub.add_parser("selftest", help="In-process smoke test").set_defaults(func=cmd_selftest)
+    sub.add_parser("profiles", help="List candidate profiles and the active one") \
+        .set_defaults(func=cmd_profiles)
+
+    sp = sub.add_parser("use-profile", help="Persist the default candidate profile")
+    sp.add_argument("profile")
+    sp.add_argument("--config", default=None, help="Alternative config.toml path")
+    sp.set_defaults(func=cmd_use_profile)
     return p
 
 

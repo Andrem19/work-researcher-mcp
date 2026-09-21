@@ -13,8 +13,12 @@ logs/
 *.log
 .playwright-mcp/
 
-# CVs are personal data synced from Google Drive — not for the repo
+# CVs are personal data kept in the local CV folder — not for the repo
 CV_collection/
+
+# Per-application drafts (statements, cover letters, enquiry emails) carry
+# personal contact details — keep them local next to the CVs
+applications/
 
 # Secrets — never commit: real config with API keys, Google OAuth files
 config.toml

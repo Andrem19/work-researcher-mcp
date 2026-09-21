@@ -5,6 +5,7 @@ from __future__ import annotations
 import aiosqlite
 
 from . import persistence as db
+from . import statement as statement_mod
 from .config import Settings
 from .domain import ApplyPlan
 
@@ -80,6 +81,10 @@ PLAYBOOKS: dict[str, str] = {
         "next/submit → confirm → browser_screenshot. Workday flows are multi-page: "
         "expect 2-4 form pages."
     ),
+    # Civil Service / DWP: the application is graded on written statements, so
+    # the mechanics below are only half the job — the assessment protocol from
+    # statement.py rides along in the plan as `assessment_protocol`.
+    "civil_service_form": statement_mod.CSJ_PLAYBOOK,
 }
 
 
@@ -87,6 +92,17 @@ def _apply_method(job: dict) -> tuple[str, str | None, list[str]]:
     """Guess how to apply from the job's source/URL."""
     url = (job.get("apply_url") or job.get("url") or "").lower()
     source = (job.get("source") or "").lower()
+    if statement_mod.is_civil_service(job):
+        # Statement-graded application: mechanics in the playbook, the
+        # mandatory assessment protocol in `assessment_protocol`.
+        return ("civil_service_form", job.get("apply_url") or job.get("url"),
+                ["STATEMENT-ASSESSED: read 'Selection process details' in the "
+                 "advert BEFORE writing — the initial sift usually runs on the "
+                 "technical statement alone (DWP 2026-08-30: 4/7 there, "
+                 "personal statement 3/7 = rejection)",
+                 "Name-blind form, no CV upload: employment history, personal "
+                 "statement and technical statement are TYPED; run "
+                 "check_statement on each text before submitting"])
     if "indeed." in url or source == "indeed":
         return ("indeed_easy_apply", job.get("apply_url") or job.get("url"),
                 ["Indeed blocks bots aggressively; prefer a logged-in browser profile",
@@ -110,6 +126,41 @@ def _apply_method(job: dict) -> tuple[str, str | None, list[str]]:
                  "to reach the Apply button; the profile now has a session",
                  "On the employer site: upload CV, fill form, submit"])
     return ("website_form", job.get("apply_url") or job.get("url"), [])
+
+
+def _protocol_steps(job: dict, apply_url: str | None,
+                    criteria: list[str]) -> list[str]:
+    """Mandatory pre-writing steps for statement-assessed (CSJ/DWP) vacancies."""
+    where = apply_url or job.get("url") or "the vacancy page"
+    steps = [
+        "STATEMENT-ASSESSED VACANCY — BEFORE any writing: open "
+        f"{where} and read 'Selection process details' IN FULL. Record: which "
+        "statement the initial sift uses, the pass mark, what the full sift "
+        "scores, and the interview stages. Writing from a search snippet is "
+        "the 2026-08-30 failure that scored personal statement 3/7.",
+        "Copy the advert's essential criteria VERBATIM into your notes (the "
+        "form grades against those exact lines) and read the AI guidance "
+        "linked from the advert.",
+        "Collect the form's word limits (the page shows a live counter) and "
+        "draft: personal statement filled to >=90% of the limit, one block "
+        "per criterion with quantified outcomes; technical statement as "
+        "quantified STARs covering design/build/test/document/integrate/"
+        "operate — a DIFFERENT example from the personal statement.",
+        "HUMANISE EVERY TEXT: run mcp__sapling__aidetect on the personal "
+        "statement, technical statement, employment history and any cover "
+        "letter / free-text answer, rewrite the flagged sentences in the "
+        "candidate's own voice until the document reports 0% AI (Sapling "
+        "needs 500+ characters to be reliable).",
+        "Gate every text with check_statement(...) (pass kind, word_limit, "
+        "criteria, the sibling text, ai_score=<Sapling %>, "
+        "ai_score_required=True) and fix all blocks and warnings — do not "
+        "submit while the verdict is not 'pass'. Record the final word counts "
+        "and Sapling readings in record_application evidence.",
+    ]
+    if criteria:
+        steps.insert(1, "Criteria extracted from the stored description "
+                        f"({len(criteria)}): " + " | ".join(criteria[:6]))
+    return steps
 
 
 async def start_application(conn: aiosqlite.Connection, settings: Settings,
@@ -198,6 +249,10 @@ async def start_application(conn: aiosqlite.Connection, settings: Settings,
         "Screenshot the confirmation page (browser_screenshot)",
         "Call record_application with status='submitted' and the screenshot as evidence",
     ]
+    protocol = statement_mod.protocol_for(job)
+    criteria = statement_mod.extract_criteria(job.get("description")) if protocol else []
+    if protocol:
+        steps = _protocol_steps(job, apply_url, criteria) + steps
     plan = ApplyPlan(
         application_id=app_id,
         job={k: job.get(k) for k in
@@ -216,6 +271,10 @@ async def start_application(conn: aiosqlite.Connection, settings: Settings,
     result = {"ok": True, "already_exists": False,
               "plan": plan.model_dump(mode="json")}
     result["plan"]["playbook"] = PLAYBOOKS.get(method, PLAYBOOKS["website_form"])
+    if protocol:
+        result["plan"]["assessment_protocol"] = protocol
+        result["plan"]["statement_plan"] = statement_mod.statement_plan(
+            criteria=criteria)
     result["plan"]["location"] = {
         k: extra.get(k) for k in ("work_mode", "distance_miles",
                                   "location_status", "location_reason")

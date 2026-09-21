@@ -3,6 +3,10 @@
 # variables: REED_API_KEY, ADZUNA_APP_ID, ADZUNA_APP_KEY, JOOBLE_API_KEY.
 
 [general]
+# Candidate selected at startup. The MCP manage_profiles tool can switch this
+# live and persist the choice. Existing single-account installations can add a
+# profile with inherit_legacy=true (example at the end) without moving data.
+active_profile = "primary"
 cv_dir = "CV_collection"
 data_dir = "data"
 log_level = "INFO"
@@ -65,16 +69,6 @@ notice_period = ""
 salary_expectation = ""
 linkedin = ""
 
-[drive]
-enabled = true
-mode = "oauth"                     # oauth | service_account | off
-account = ""                       # your Google account (informational)
-folder_name = "CV"                 # the Drive folder holding your CVs
-folder_id = ""                     # optional: paste the Drive folder id to skip lookup
-credentials_file = "secrets/google_credentials.json"
-token_file = "secrets/google_token.json"
-service_account_file = "secrets/google_service_account.json"
-
 [auth]
 # Pre-approved by you: the agent may click "Sign in with Google" and pick
 # this account on job boards WITHOUT asking permission (2FA/captcha → ask).
@@ -116,3 +110,32 @@ uk_only = true
 [providers.findajob]
 enabled = true                     # GOV.UK Work Hub (jobs.service.gov.uk/jobs)
 browser_only = true                # JS SPA — searched via browser, not HTTP
+
+# The default profile keeps the traditional top-level [applicant], [auth] and
+# [blocklist] sections above. This preserves full compatibility with
+# the original single-account layout and its existing CV/DB/browser folders.
+[profiles.primary]
+display_name = "Primary candidate"
+inherit_legacy = true
+data_dir = "data"
+cv_dir = "CV_collection"
+instructions = "Use only this candidate's data, CVs and authenticated accounts."
+
+# To add another fully isolated person, copy/uncomment and fill this pattern:
+# [profiles.partner]
+# display_name = "Partner"
+# instructions = "Candidate-specific job goals and application guidance."
+# # data_dir and cv_dir are optional; defaults are profiles/partner/data and
+# # profiles/partner/CV_collection.
+#
+# [profiles.partner.applicant]
+# full_name = ""
+# email = ""
+# phone = ""
+# home_location = ""
+# daily_commute_miles = 25
+# occasional_commute_miles = 50
+#
+# [profiles.partner.auth]
+# google_account = ""
+# auto_google_signin = true

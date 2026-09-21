@@ -4,9 +4,9 @@ Tool surface is deliberately COMPACT (24 tools, prefix-grouped) so mid-size
 agents can hold it in mind:
 
   search     get_status, search_jobs, get_job, submit_job_observations
-  cv         list_cvs, sync_cvs, push_cv_to_drive
+  cv         list_cvs, sync_cvs
   apply      start_application, record_application, list_applications,
-             check_applied
+             check_applied, check_statement, record_sift_feedback
   browser    browser_open, browser_snapshot, browser_form, browser_click,
              browser_set, browser_type, browser_upload, browser_press,
              browser_wait, browser_screenshot, browser_eval, browser_tabs,
@@ -25,17 +25,24 @@ from typing import Any, Literal
 
 from mcp.server import MCPServer
 
-from . import dedup, drive as drive_mod
+from . import dedup
 from . import persistence as db
+from . import statement as statement_mod
 from . import tracker as tracker_mod
-from .config import Settings, ensure_dirs, load_settings
+from .config import Settings, ensure_dirs, load_settings, set_active_profile
 from .domain import JobCard, SearchParams
 from .providers import BROWSER_ONLY_NOTES, run_search
 from .ranking import score_job
 from .textutils import job_hash
 
 INSTRUCTIONS = (
-    "Work Researcher MCP: UK job search + application engine (28 compact tools). "
+    "Work Researcher MCP: UK job search + application engine (31 compact tools). "
+    "CANDIDATE SAFETY: call manage_profiles(action='list') or get_status at the "
+    "start of a task and verify active_profile before searching or applying. Use "
+    "manage_profiles(action='switch', profile='...') when the user selects another "
+    "candidate; profile accepts either the canonical id or full display name. "
+    "candidate. Profiles isolate CV folders, application history and browser "
+    "logins; never assume that a job or login from one profile exists in another. "
     "ADAPTIVE SEARCH RESPONSES: on search_jobs and get_job pass context_window "
     "equal to your model's advertised context size. Local Qwen 3.8 27B MUST pass "
     "context_window=78000 (or response_profile='compact'); models around 100k-256k "
@@ -60,7 +67,7 @@ INSTRUCTIONS = (
     "[auth] WITHOUT asking the user (2FA/captcha → stop and ask); (6) drive the "
     "submission with browser_* tools; (7) record_application(status='submitted', "
     "evidence={screenshot}). LOCATION INTELLIGENCE: results carry work_mode / "
-    "distance_miles / location_status (home=Blackpool per config). Remote jobs "
+    "distance_miles / location_status (home comes from the active profile). Remote jobs "
     "are searched UK-wide; on-site jobs outside max_commute_miles "
     "are flagged mismatch — never submit those without explicit user approval. "
     "LOCATION IS WORK-MODE-AWARE: on_site (daily office) must be within "
@@ -100,7 +107,29 @@ INSTRUCTIONS = (
     "SCRAPE_LINKS_JS from providers/govuk_workhub.py via browser_eval → "
     "submit_job_observations. Its REMOTE/ONSITE/HYBRID/FIELD_BASED filters "
     "map directly to work_mode. Dedup merges the same vacancy "
-    "across boards — check sources[] and already_applied before applying."
+    "across boards — check sources[] and already_applied before applying. "
+    "STATEMENT-ASSESSED APPLICATIONS (Civil Service Jobs / DWP and any advert "
+    "graded on written statements — detected automatically; start_application "
+    "then returns assessment_protocol + statement_plan): the score IS the "
+    "writing, so the protocol is mandatory. (1) Open the advert and read "
+    "'Selection process details' IN FULL before writing anything — it names "
+    "which statement the initial sift uses (DWP sifts the technical statement "
+    "first) and the pass mark; never write from a search snippet. (2) Copy the "
+    "essential criteria VERBATIM from the advert. (3) Fill the personal "
+    "statement to >=90% of the form's word limit, one block per criterion, "
+    "each with WHAT/HOW/OUTCOME in numbers. (4) Write the technical statement "
+    "as quantified STARs covering design/build/test/document/integrate/operate, "
+    "using an example DIFFERENT from the personal statement (the two are "
+    "scored separately). (5) HUMANISE: run mcp__sapling__aidetect on every "
+    "text we submit (personal statement, technical statement, employment "
+    "history, cover letter, free-text answers) and rewrite until it reports "
+    "0% AI. (6) Gate every text with check_statement(kind, word_limit, "
+    "criteria, other_text=<sibling>, ai_score=<Sapling %>, "
+    "ai_score_required=True) and fix every block and warning — never submit "
+    "on verdict != 'pass'. (7) record_sift_feedback "
+    "when the panel's scores arrive. The 2026-08-30 DWP Data Engineer Level I "
+    "rejection (technical 4/7 = exactly the bar, personal statement 3/7 = below "
+    "it, 441 of 750 words used) is the failure these rules prevent."
 )
 
 logger = logging.getLogger("work_researcher")
@@ -190,15 +219,103 @@ def create_server(settings: Settings | None = None) -> tuple[MCPServer, Settings
 
 
 def _register_tools(mcp: MCPServer, settings: Settings) -> None:
-    from .browser import BrowserError, get_session
+    from .browser import close_profile_session, get_session
     from .cvmanager import index_cvs as _index_cvs
     from .cvmanager import recommend_cv as _recommend_cv
+
+    profile_lock = asyncio.Lock()
+
+    # ----------------------------------------------------------- profile ----
+    @mcp.tool()
+    async def manage_profiles(
+        action: Literal["list", "switch"] = "list",
+        profile: str | None = None,
+    ) -> dict:
+        """List candidate profiles or switch the active candidate.
+
+        ``switch`` persists [general].active_profile in config.toml and takes
+        effect immediately. It closes the old candidate's browser first, then
+        changes the isolated CV folder, database/application history and
+        browser-login folder. Always list/verify profiles before a
+        search or application task for a named person.
+        """
+        if action == "list":
+            try:
+                fresh = load_settings(settings.config_path, profile=settings.profile_id)
+                catalog = fresh.available_profiles
+            except RuntimeError as exc:
+                return {
+                    "error": f"could not reload profile catalog: {exc}",
+                    "active_profile": settings.profile_id,
+                    "profiles": settings.available_profiles,
+                }
+            return {
+                "active_profile": settings.profile_id,
+                "active_display_name": settings.profile_name,
+                "active_instructions": settings.profile_instructions or None,
+                "profiles": catalog,
+                "selection": {
+                    "manual": "edit [general].active_profile in config.toml",
+                    "agent": "manage_profiles(action='switch', profile='<id>')",
+                    "environment_override": "WORK_RESEARCHER_PROFILE",
+                },
+            }
+        if not profile:
+            return {"error": "profile is required when action='switch'"}
+
+        async with profile_lock:
+            try:
+                replacement = load_settings(settings.config_path, profile=profile)
+            except RuntimeError as exc:
+                return {"error": str(exc), "profiles": settings.available_profiles}
+            if replacement.profile_id == settings.profile_id:
+                return {
+                    "ok": True,
+                    "changed": False,
+                    "active_profile": settings.profile_id,
+                    "display_name": settings.profile_name,
+                    "instructions": settings.profile_instructions or None,
+                    "note": "profile was already active",
+                }
+
+            # A live page may be authenticated as the previous candidate. Close
+            # it before changing any path or identity, even if persistence later
+            # fails, so accounts can never share one application session.
+            await close_profile_session(settings)
+            ensure_dirs(replacement)
+            await db.init_db(replacement.db_path)
+            try:
+                persisted = set_active_profile(settings.config_path, profile)
+            except (OSError, RuntimeError) as exc:
+                return {
+                    "error": f"profile is valid but could not be persisted: {exc}",
+                    "active_profile": settings.profile_id,
+                }
+            settings.activate_from(persisted)
+            configure_logging(settings)
+            async with db.connect(settings.db_path) as conn:
+                await db.ensure_seed_blocklist(conn, settings)
+                await conn.commit()
+            return {
+                "ok": True,
+                "changed": True,
+                "active_profile": settings.profile_id,
+                "display_name": settings.profile_name,
+                "instructions": settings.profile_instructions or None,
+                "cv_dir": str(settings.cv_dir),
+                "database": str(settings.db_path),
+                "browser_profile": str(settings.browser_profile_dir),
+                "note": (
+                    "old browser closed; new profile is active now and persisted in config.toml; "
+                    "WORK_RESEARCHER_PROFILE, if set, still overrides startup selection"
+                ),
+            }
 
     # ------------------------------------------------------------ search ----
     @mcp.tool()
     async def get_status() -> dict:
-        """Health/config snapshot: DB stats, providers, API keys, Google Drive,
-        CV index, saved search profiles. Call first in a new session."""
+        """Health/config snapshot: active candidate, local CV directory, DB
+        stats, providers, API keys and saved searches. Call first in a session."""
         async with db.connect(settings.db_path) as conn:
             jobs = await db.count_rows(conn, "jobs")
             apps = await db.count_rows(conn, "applications")
@@ -225,11 +342,24 @@ def _register_tools(mcp: MCPServer, settings: Settings) -> None:
         except ImportError:
             pw = "MISSING"
         return {
+            "active_profile": {
+                "id": settings.profile_id,
+                "display_name": settings.profile_name,
+                "instructions": settings.profile_instructions or None,
+                "available": list(settings.available_profiles),
+                "cv_dir": str(settings.cv_dir),
+                "data_dir": str(settings.data_dir),
+            },
             "database": {"jobs": jobs, "applications": apps, "cvs": cvs,
                          "searches": searches, "path": str(settings.db_path)},
             "providers": providers,
             "browser_only_sources": BROWSER_ONLY_NOTES,
-            "drive": await drive_mod.status(settings),
+            "cv_storage": {
+                "mode": "local_manual",
+                "directory": str(settings.cv_dir),
+                "instruction": "Copy CV files here, then call sync_cvs to index them",
+                "extensions": [".docx", ".pdf", ".doc"],
+            },
             "playwright": pw,
             "browser_profile": str(settings.browser_profile_dir),
             "search_profiles": {k: v.get("query")
@@ -484,6 +614,10 @@ def _register_tools(mcp: MCPServer, settings: Settings) -> None:
                 b["apply_method"] = method
                 briefs.append(b)
             out = {
+                "active_profile": {
+                    "id": settings.profile_id,
+                    "display_name": settings.profile_name,
+                },
                 "search_id": search_id, "total": total,
                 "showing": f"{offset + 1}-{offset + len(rows)} of {total}",
                 "next_offset": offset + limit if offset + limit < total else None,
@@ -521,9 +655,11 @@ def _register_tools(mcp: MCPServer, settings: Settings) -> None:
                                         "(pass include_training=true to see them)")
             if location_skipped:
                 out["location_skipped"] = location_skipped
-                out["note_location"] = ("on-site jobs beyond the commute limit "
-                                        "were dropped (work-mode-aware: daily ≤25mi, "
-                                        "hybrid/field ≤50mi, remote unlimited)")
+                out["note_location"] = (
+                    "on-site jobs beyond the active profile's commute limit were dropped "
+                    f"(work-mode-aware: daily ≤{settings.daily_commute_miles}mi, "
+                    f"hybrid/field ≤{settings.occasional_commute_miles}mi, remote unlimited)"
+                )
             return out
 
     @mcp.tool()
@@ -559,7 +695,7 @@ def _register_tools(mcp: MCPServer, settings: Settings) -> None:
         balanced (12). All remaining results stay stored. Results are ranked,
         cross-board duplicates merged (sources[]), with memory flags
         (already_applied, application_status) and location intelligence
-        (work_mode, distance_miles from Blackpool, location_status
+        (work_mode, distance_miles from the active profile's home, location_status
         ok|mismatch|caution|unknown). PAID TRAINING/COURSE ADS (where you pay
         them, e.g. Netcom-style 'trainee' course marketing) are excluded
         automatically — training_offers_skipped shows how many; set
@@ -669,6 +805,18 @@ def _register_tools(mcp: MCPServer, settings: Settings) -> None:
                     "requirements_status": extra.get("requirements_status"),
                     "requirements_unmet": extra.get("requirements_unmet"),
                 })
+                if statement_mod.is_civil_service(job):
+                    job["assessment"] = "statement_assessed_civil_service"
+                    job["assessment_note"] = (
+                        "Graded on written statements, not a CV upload. Read "
+                        "'Selection process details' in the advert before "
+                        "writing; start_application returns the full protocol, "
+                        "check_statement gates each text.")
+                    if include_description:
+                        criteria = statement_mod.extract_criteria(
+                            job.get("description"))
+                        if criteria:
+                            job["essential_criteria_from_advert"] = criteria
                 if not include_description:
                     job["description"] = (job.get("description") or "")[:400] + "…"
                 app = await db.application_for_job(conn, jid)
@@ -903,7 +1051,7 @@ def _register_tools(mcp: MCPServer, settings: Settings) -> None:
     # ----------------------------------------------------------------- cv ----
     @mcp.tool()
     async def list_cvs(job_id: str | None = None) -> dict:
-        """Indexed CVs (tags: data_analytics/geology/…, previews, drive link).
+        """CVs indexed from the active profile's local folder.
         Pass job_id to get per-CV recommendation scores for that job."""
         async with db.connect(settings.db_path) as conn:
             cvs = await db.list_cvs(conn)
@@ -913,28 +1061,25 @@ def _register_tools(mcp: MCPServer, settings: Settings) -> None:
                 if not job:
                     return {"error": f"unknown job_id {job_id}"}
                 recs = await _recommend_cv(conn, job, limit=5)
-            return {"cvs": cvs, "recommendations_for_job": recs or None}
+            return {
+                "active_profile": settings.profile_id,
+                "cv_dir": str(settings.cv_dir),
+                "cvs": cvs,
+                "recommendations_for_job": recs or None,
+                "note": "Copy CV files into cv_dir manually; call sync_cvs after changes",
+            }
 
     @mcp.tool()
-    async def sync_cvs(source: str = "both", force: bool = False) -> dict:
-        """Refresh the CV index. source: 'local' (scan CV_collection),
-        'drive' (pull new/changed files from Google Drive folder 'CV' on
-        ry4ara@gmail.com, then index), 'both' (default). Drive needs one-time
-        credentials (see SETUP.md) — returns setup_needed otherwise."""
-        results: dict[str, Any] = {}
-        if source in ("drive", "both"):
-            results["drive"] = await drive_mod.sync(settings)
-        if source in ("local", "both"):
-            results["index"] = await _index_cvs(settings, force=force)
-        return results
-
-    @mcp.tool()
-    async def push_cv_to_drive(path: str, force: bool = False) -> dict:
-        """Push a locally edited CV back to Google Drive (update known file or
-        create in the CV folder). Edit loop: edit docx in CV_collection →
-        sync_cvs(source='local') → push_cv_to_drive. Refuses to overwrite when
-        the Drive copy changed after our last pull (force to override)."""
-        return await drive_mod.upload_cv(settings, path, force=force)
+    async def sync_cvs(force: bool = False) -> dict:
+        """Index CV files manually copied into the active profile's cv_dir.
+        Unchanged files are skipped unless force=true. There is no cloud sync."""
+        result = await _index_cvs(settings, force=force)
+        return {
+            "active_profile": settings.profile_id,
+            "cv_dir": str(settings.cv_dir),
+            "storage": "local_manual",
+            **result,
+        }
 
     # ------------------------------------------------------------- apply ----
     @mcp.tool()
@@ -948,6 +1093,11 @@ def _register_tools(mcp: MCPServer, settings: Settings) -> None:
         async with db.connect(settings.db_path) as conn:
             result = await tracker_mod.start_application(conn, settings, job_id, cv_id, notes)
             await conn.commit()
+        result["active_profile"] = {
+            "id": settings.profile_id,
+            "display_name": settings.profile_name,
+            "instructions": settings.profile_instructions or None,
+        }
         return result
 
     @mcp.tool()
@@ -1008,12 +1158,120 @@ def _register_tools(mcp: MCPServer, settings: Settings) -> None:
             }
 
     @mcp.tool()
+    async def check_statement(
+        text: str,
+        kind: str = "personal_statement",
+        word_limit: int | None = None,
+        criteria: list[str] | None = None,
+        other_text: str | None = None,
+        forbidden_terms: list[str] | None = None,
+        ai_score: float | None = None,
+        ai_score_required: bool = False,
+    ) -> dict:
+        """Quality gate for STATEMENT-ASSESSED applications (Civil Service /
+        DWP and any form graded on written statements). Run it on every text
+        BEFORE submitting and fix every block and warning.
+
+        kind: personal_statement | technical_statement | employment_history.
+        word_limit: the limit shown on the form (PS often 750-1250, technical 250).
+        criteria: the advert's essential criteria, verbatim.
+        other_text: the sibling statement — catches a story reused across two
+        separately-scored texts.
+        ai_score: the percentage reported by mcp__sapling__aidetect for THIS
+        text. Every text we submit must read as human-written: run Sapling
+        first, rewrite until it reports 0% AI. A non-zero score blocks; for
+        statement-assessed applications pass ai_score_required=True so the
+        gate cannot reach 'pass' before Sapling has been run.
+        Returns verdict pass|revise|block, word count vs budget, and concrete
+        fixes (unfilled budget, missing quantification, missing STAR verbs,
+        uncovered criteria, name-blind violations, filler/AI phrasing,
+        AI-detector score).
+
+        The 2026-08-30 DWP Data Engineer Level I rejection: personal statement
+        3/7 against a 4/7 bar (441 of 750 words used), technical 4/7 (no
+        margin), employment history not assessed."""
+        forbidden = [t for t in (forbidden_terms or []) if t]
+        applicant = settings.applicant or {}
+        name = str(applicant.get("full_name") or "")
+        # Auto-derived terms are blocked, so single name tokens must be
+        # distinctive: a short first name could collide with ordinary words.
+        name_tokens = [t for t in name.split() if len(t) >= 5]
+        for value in (name, *name_tokens, applicant.get("email"),
+                      applicant.get("phone"), applicant.get("home_location"),
+                      applicant.get("home_postcode"), applicant.get("linkedin")):
+            v = str(value or "").strip()
+            if len(v) >= 3 and v not in forbidden:
+                forbidden.append(v)
+        review = statement_mod.review_statement(
+            text, kind=kind, word_limit=word_limit, criteria=criteria,
+            other_text=other_text, forbidden_terms=forbidden,
+            ai_score=ai_score, ai_score_required=ai_score_required)
+        review["next_step"] = (
+            "rewrite the flagged parts and re-run check_statement"
+            if review["verdict"] != "pass" else "safe to paste into the form")
+        return review
+
+    @mcp.tool()
+    async def record_sift_feedback(
+        application_id: str,
+        technical_score: int | None = None,
+        personal_statement_score: int | None = None,
+        cv_score: int | None = None,
+        threshold: int = 4,
+        outcome: str | None = None,
+        comments: str | None = None,
+    ) -> dict:
+        """Store a sift panel's scores on an application and turn them into
+        fixes for the NEXT statement. Civil Service bands run 1-7 (Not
+        demonstrated → Outstanding); `threshold` is the pass mark the panel
+        states in its comments (DWP: 4)."""
+        lessons = statement_mod.lessons_from_scores(
+            technical=technical_score,
+            personal_statement=personal_statement_score,
+            cv=cv_score, threshold=threshold)
+        evidence = {
+            "sift_feedback": {
+                "technical_score": technical_score,
+                "technical_band": statement_mod.band_name(technical_score),
+                "personal_statement_score": personal_statement_score,
+                "personal_statement_band": statement_mod.band_name(
+                    personal_statement_score),
+                "cv_score": cv_score,
+                "threshold": threshold,
+                "outcome": outcome,
+                "comments": comments,
+            },
+            "sift_lessons": lessons,
+        }
+        async with db.connect(settings.db_path) as conn:
+            app = await db.get_application(conn, application_id)
+            if app is None:
+                return {"error": f"unknown application_id {application_id}"}
+            note = (app.get("notes") or "")
+            note = (note + "\n\n" if note else "") + (
+                f"SIFT FEEDBACK {outcome or ''}: technical={technical_score}, "
+                f"personal_statement={personal_statement_score}, cv={cv_score}, "
+                f"threshold={threshold}. {comments or ''}").strip()
+            app = await db.update_application(
+                conn, application_id,
+                status="rejected" if (outcome or "").lower().startswith("reject")
+                else None,
+                notes=note, evidence=evidence)
+            await conn.commit()
+        return {"ok": True, "application_id": application_id,
+                "scores": evidence["sift_feedback"], "lessons": lessons}
+
+    @mcp.tool()
     async def make_cover_letter(text: str, name: str = "Cover_Letter") -> dict:
         """Write a cover letter as a DOCX file into CV_collection and return
         its path — ready for browser_upload as a supporting file. Boards like
         Totaljobs reject files smaller than 8KB, so the document is padded
         through metadata if the text alone is too short. Prefer DOCX over PDF
-        here (PDFs from minimal text are usually under the limit)."""
+        here (PDFs from minimal text are usually under the limit).
+
+        Every text we send must read as human-written: run
+        mcp__sapling__aidetect on the letter and rewrite until it reports 0%
+        AI before uploading."""
         import re as _re
 
         from docx import Document
@@ -1042,14 +1300,16 @@ def _register_tools(mcp: MCPServer, settings: Settings) -> None:
         size = await asyncio.to_thread(_build)
         return {"path": str(out), "size_bytes": size,
                 "min_board_limit": 8192,
-                "note": "upload with browser_upload as a supporting file"}
+                "note": "upload with browser_upload as a supporting file",
+                "ai_check": "run mcp__sapling__aidetect on the letter text and "
+                            "rewrite until it reports 0% AI before uploading"}
 
     # ---------------------------------------------------------- browser ----
     @mcp.tool()
     async def browser_login(url: str) -> dict:
         """Ensure we're signed in on a job board before applying. Opens the
         site; if signed out, walks 'Continue with Google' and picks the
-        pre-approved account (config [auth].google_account — the user allows
+        pre-approved account (active profile auth.google_account — the user allows
         this WITHOUT asking). Returns logged_in; needs_user=true on 2FA/
         captcha/consent — then stop and ask the user to finish in the window."""
         account = settings.auth.get("google_account") \

@@ -33,10 +33,42 @@ def _norm(text: str | None) -> str:
     return re.sub(r"[^a-z0-9 ]", "", (text or "").lower()).strip()
 
 
+# Query params that carry tracking/campaign data, never job identity.
+_TRACKING_PARAMS = frozenset({
+    "fbclid", "gclid", "msclkid", "dclid", "mc_cid", "mc_eid", "spm",
+    "campaignid", "tk", "bb", "se", "ref", "ref_src", "via", "trk",
+    "trkinfo", "etid", "cmpid", "sharedid", "publisherid",
+})
+
+
 def _url_key(url: str | None) -> str | None:
+    """Canonical URL identity for dedup.
+
+    The full query string must NOT be discarded wholesale: boards like Indeed
+    put the job id in it (`viewjob?jk=...`) while the path is identical for
+    every vacancy. For Indeed hosts the jk/vjk param alone is the identity
+    (search URLs carry vjk for the same job the view URL carries as jk).
+    Everywhere else the path plus non-tracking params form the key, so
+    paginated/filtered variants of one listing still collapse while distinct
+    job ids never do.
+    """
     if not url:
         return None
-    return re.sub(r"[?#].*$", "", url.strip().rstrip("/")).lower()
+    url = url.strip().rstrip("/")
+    m = re.match(r"^(https?://[^/?#]+)([^?#]*)(?:\?([^#]*))?(?:#.*)?$",
+                 url, re.IGNORECASE)
+    if not m:
+        return re.sub(r"[?#].*$", "", url).lower()
+    host, path, query = m.group(1).lower(), (m.group(2) or "").lower(), m.group(3) or ""
+    params = [(k.strip().lower(), v.strip().lower())
+              for k, _, v in (p.partition("=") for p in query.split("&") if p)]
+    if host.endswith("indeed.com"):
+        jk = next((v for k, v in params if k in ("jk", "vjk") and v), None)
+        if jk:
+            return f"{host}::jk={jk}"
+    kept = sorted(f"{k}={v}" for k, v in params
+                  if not k.startswith("utm_") and k not in _TRACKING_PARAMS)
+    return f"{host}{path}" + (f"?{'&'.join(kept)}" if kept else "")
 
 
 async def load_pool(conn: aiosqlite.Connection, window_days: int = 45,
@@ -83,6 +115,13 @@ def resolve(card: JobCard, chash: str, pool: list[dict]) -> str | None:
     if card_url:
         for row in pool:
             if card_url == _url_key(row["url"]):
+                # Same canonical URL but a plainly different company means a
+                # URL-key collision, not the same vacancy — leave it to the
+                # fuzzy pass instead of merging the wrong identity in.
+                c2 = _norm(row.get("company"))
+                if card.company and c2 and fuzz.token_set_ratio(
+                        _norm(card.company), c2) < COMPANY_THRESHOLD:
+                    continue
                 return row["content_hash"]
     for row in pool:
         if _fuzzy_match(card, row):

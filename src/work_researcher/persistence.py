@@ -85,8 +85,6 @@ CREATE TABLE IF NOT EXISTS cvs (
     sha256 TEXT,
     size INTEGER,
     mtime TEXT,
-    drive_file_id TEXT,
-    drive_modified TEXT,
     text_preview TEXT,
     full_text TEXT,
     tags TEXT,
@@ -213,8 +211,12 @@ async def upsert_jobs(conn: aiosqlite.Connection, cards: list[JobCard],
                 f"INSERT INTO jobs ({_COLS}) VALUES ({','.join('?' * 23)})", row
             )
         else:
-            # keep the freshest non-empty fields, but never clobber with emptier
-            # ones; merge extra JSON so geo/work-mode data backfills old rows
+            # Non-destructive merge: a duplicate card may only FILL fields the
+            # canonical row is missing (description: keep the longer text).
+            # Existing identity fields are never overwritten — a wrong dedup
+            # match must not be able to rewrite a stored vacancy (that once
+            # turned one employer's row into another's). extra JSON still
+            # refreshes location intel in place and backfills the rest.
             cur2 = await conn.execute("SELECT extra FROM jobs WHERE id=?", (job_id,))
             old_row = await cur2.fetchone()
             old_extra = {}
@@ -234,13 +236,19 @@ async def upsert_jobs(conn: aiosqlite.Connection, cards: list[JobCard],
                         or old_extra.get(k) is None:
                     merged_extra[k] = v
             await conn.execute(
-                """UPDATE jobs SET last_seen=?, url=COALESCE(?,url),
-                   apply_url=COALESCE(?,apply_url), title=COALESCE(?,title),
-                   company=COALESCE(?,company), location_text=COALESCE(?,location_text),
-                   salary_raw=COALESCE(?,salary_raw), salary_min=COALESCE(?,salary_min),
-                   salary_max=COALESCE(?,salary_max), salary_period=COALESCE(?,salary_period),
-                   contract_type=COALESCE(?,contract_type),
-                   work_from_home=COALESCE(?,work_from_home),
+                """UPDATE jobs SET last_seen=?,
+                   url=COALESCE(url,?), apply_url=COALESCE(apply_url,?),
+                   title=CASE WHEN COALESCE(title,'')='' THEN ? ELSE title END,
+                   company=CASE WHEN COALESCE(company,'')='' THEN ? ELSE company END,
+                   location_text=CASE WHEN COALESCE(location_text,'')=''
+                                      THEN ? ELSE location_text END,
+                   salary_raw=CASE WHEN COALESCE(salary_raw,'')=''
+                                   THEN ? ELSE salary_raw END,
+                   salary_min=COALESCE(salary_min,?), salary_max=COALESCE(salary_max,?),
+                   salary_period=COALESCE(salary_period,?),
+                   contract_type=CASE WHEN COALESCE(contract_type,'')=''
+                                      THEN ? ELSE contract_type END,
+                   work_from_home=COALESCE(work_from_home,?),
                    description=CASE WHEN length(?)>length(COALESCE(description,''))
                                     THEN ? ELSE description END,
                    posted_at=COALESCE(posted_at,?), fetched_at=?, extra=?
@@ -472,31 +480,43 @@ async def application_for_job(conn: aiosqlite.Connection, job_id: str) -> dict |
     return dict(row) if row else None
 
 
+async def get_application(conn: aiosqlite.Connection,
+                          app_id: str) -> dict | None:
+    cur = await conn.execute(
+        "SELECT a.*, j.title AS job_title, j.company AS company "
+        "FROM applications a JOIN jobs j ON j.id=a.job_id WHERE a.id=?",
+        (app_id,),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
 # ----------------------------------------------------------------- cvs ----
 async def upsert_cv(conn: aiosqlite.Connection, rec: dict) -> str:
     cv_id = rec.get("id") or new_id("cv")
     await conn.execute(
-        """INSERT INTO cvs (id, filename, path, sha256, size, mtime, drive_file_id,
-                            drive_modified, text_preview, full_text, tags, language,
+        """INSERT INTO cvs (id, filename, path, sha256, size, mtime,
+                            text_preview, full_text, tags, language,
                             name_guess, indexed_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(path) DO UPDATE SET
                filename=excluded.filename, sha256=excluded.sha256, size=excluded.size,
-               mtime=excluded.mtime, drive_file_id=COALESCE(excluded.drive_file_id, drive_file_id),
-               drive_modified=COALESCE(excluded.drive_modified, drive_modified),
+               mtime=excluded.mtime,
                text_preview=excluded.text_preview, full_text=excluded.full_text,
                tags=excluded.tags, language=excluded.language,
                name_guess=excluded.name_guess, indexed_at=excluded.indexed_at""",
         (cv_id, rec["filename"], rec["path"], rec.get("sha256"), rec.get("size"),
-         rec.get("mtime"), rec.get("drive_file_id"), rec.get("drive_modified"),
-         rec.get("text_preview"), rec.get("full_text"), rec.get("tags"),
-         rec.get("language"), rec.get("name_guess"), now_iso()),
+         rec.get("mtime"), rec.get("text_preview"), rec.get("full_text"),
+         rec.get("tags"), rec.get("language"), rec.get("name_guess"), now_iso()),
     )
     return cv_id
 
 
 async def list_cvs(conn: aiosqlite.Connection) -> list[dict]:
-    cur = await conn.execute("SELECT * FROM cvs ORDER BY filename")
+    cur = await conn.execute(
+        "SELECT id, filename, path, sha256, size, mtime, text_preview, tags, "
+        "language, name_guess, indexed_at FROM cvs ORDER BY filename"
+    )
     rows = []
     for r in await cur.fetchall():
         d = dict(r)

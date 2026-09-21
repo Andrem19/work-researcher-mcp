@@ -26,7 +26,7 @@ Support tiers used by Work Researcher MCP:
 | [CWJobs / TechnoJobs](https://www.cwjobs.co.uk) | future | IT boards, HTML like Totaljobs |
 | [jobs.ac.uk](https://www.jobs.ac.uk) | future | academia — research geology roles; plain HTML |
 | [Rigzone](https://www.rigzone.com) / [Oilandgasjobsearch](https://www.oilandgasjobsearch.com) | future | energy/geoscience niches |
-| [Civil Service Jobs](https://www.jobsearch.civilservicejobs.service.gov.uk) | future | own account, geology/data roles in gov |
+| [Civil Service Jobs](https://www.jobsearch.civilservicejobs.service.gov.uk) | browser | own account (sign in only through the vacancy's "Apply now" — one-shot link). Applications are graded on WRITTEN STATEMENTS band by band, not on a CV upload; DWP/Government Recruitment Service ads reached via Work Hub redirect here. The apply plan carries `assessment_protocol` + `statement_plan`, and every text must pass `check_statement` before pasting. |
 | [Escape the City](https://escapethecity.org) | future | career-change niche |
 | [eFinancialCareers](https://www.efinancialcareers.co.uk) | future | finance analytics roles |
 
