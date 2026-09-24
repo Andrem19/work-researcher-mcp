@@ -136,6 +136,29 @@ src/work_researcher/
   seller.py        agency vs employer             config.py     config.toml + env
 ```
 
+## Local verification
+
+GitHub Actions is **not** part of this project's verification. There is no hosted
+workflow in this repository and no status check to wait for; verification is the
+local command sequence below, run on the development machine against the commit
+being reviewed. Record the result — command, host, Python version, commit SHA — in
+the pull request. An unrun check must not be presented as a passing one.
+
+```bash
+uv sync --extra dev                        # once, per checkout
+uv run python -m compileall -q src tests   # syntax gate
+uv run pytest -q                           # automated tests
+uv run work-researcher selftest            # in-process smoke test
+```
+
+`compileall` and `pytest` are the blocking pair: both must exit 0. `selftest` is a
+smoke test of the running server — tool registration, dedup, application guard,
+provider imports, browser import — and needs no network or API keys.
+
+`ruff` is configured in `pyproject.toml` and is **not** part of the gate. It
+currently reports findings, so a clean `ruff check .` is not a precondition for a
+change; run it only if you intend to act on its output.
+
 ## License
 
 MIT
