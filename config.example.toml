@@ -67,13 +67,18 @@ linkedin = ""
 
 [drive]
 enabled = true
-mode = "oauth"                     # oauth | service_account | off
-account = ""                       # your Google account (informational)
-folder_name = "CV"                 # the Drive folder holding your CVs
-folder_id = ""                     # optional: paste the Drive folder id to skip lookup
-credentials_file = "secrets/google_credentials.json"
-token_file = "secrets/google_token.json"
-service_account_file = "secrets/google_service_account.json"
+# public_folder: the folder is shared "anyone with the link" — sync_cvs
+# downloads anonymously, no Google credentials at all, and push_cv_to_drive
+# is refused (read-only). oauth / service_account: private-folder modes with
+# write support (see SETUP.md).
+mode = "public_folder"
+folder_url = "https://drive.google.com/drive/folders/<FOLDER-ID>"
+folder_name = "CV"                 # informational label for the folder
+folder_id = ""                     # alternative to folder_url: just the id
+account = ""                       # your Google account (informational; unused in public_folder)
+credentials_file = "secrets/google_credentials.json"   # oauth mode only
+token_file = "secrets/google_token.json"               # oauth mode only
+service_account_file = "secrets/google_service_account.json"  # service_account mode only
 
 [auth]
 # Pre-approved by you: the agent may click "Sign in with Google" and pick

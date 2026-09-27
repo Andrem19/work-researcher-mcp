@@ -24,11 +24,33 @@ lives here.
 Without keys the server still searches Totaljobs + Reed(HTML) + Earthworks
 and tells you which providers are missing credentials in `get_status`.
 
-## 3. Google Drive CV sync (read AND write)
+## 3. Google Drive CV sync
 
-Point it at any Drive folder that holds your CVs. Two auth modes:
+Point it at any Drive folder that holds your CVs. Three modes:
 
-### Option A — OAuth (recommended, personal account)
+### Option A — Public folder (zero credentials; the Remtz Hub mode)
+
+The folder is shared "anyone with the link": sync is anonymous and read-only,
+and no Google Cloud project, OAuth JSON, API key or service account exists
+anywhere in the setup.
+
+1. In Google Drive: CV folder → Share → **Anyone with the link** (Viewer).
+2. In `config.toml`:
+   ```toml
+   [drive]
+   mode = "public_folder"
+   folder_url = "https://drive.google.com/drive/folders/<FOLDER-ID>"
+   ```
+3. Done. `sync_cvs` (MCP) or `uv run work-researcher drive-sync` lists the
+   public folder anonymously, downloads DOCX/PDF/DOC into `CV_collection/`
+   and indexes them. An unchanged file is detected by content hash and not
+   rewritten; a changed file replaces the local copy.
+
+This mode is **read-only by design**: `push_cv_to_drive` is refused. To edit
+a CV, edit the file in Google Drive and run `sync_cvs` again — the next sync
+picks up the change.
+
+### Option B — OAuth (private folder, write support)
 
 1. Go to https://console.cloud.google.com → create/select a project.
 2. **APIs & Services → Library** → enable **Google Drive API**.
@@ -43,7 +65,7 @@ Point it at any Drive folder that holds your CVs. Two auth modes:
    ```
    The token is cached at `secrets/google_token.json`.
 
-### Option B — Service account
+### Option C — Service account
 
 1. Create a service account in the same project, enable the Drive API.
 2. Download the JSON key → `secrets/google_service_account.json`.
@@ -51,11 +73,11 @@ Point it at any Drive folder that holds your CVs. Two auth modes:
 4. **Share** the Drive folder with the service-account e-mail —
    otherwise it sees nothing.
 
-After setup: `sync_cvs` (MCP) or `uv run work-researcher drive-sync` pulls
-CVs into `CV_collection/` and indexes them. Editing loop: the agent edits
+In the OAuth/service-account modes the editing loop is: the agent edits
 the docx locally, then `push_cv_to_drive` writes it back (update if the
 file is known, create otherwise; refuses to clobber a Drive copy that
-changed after our last pull unless `force=true`).
+changed after our last pull unless `force=true`). In the public-folder mode
+this push is refused — the bot never writes to Drive.
 
 ## 4. Board logins for applications
 
