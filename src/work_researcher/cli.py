@@ -124,6 +124,10 @@ async def cmd_drive_auth(args) -> int:
     from .drive import run_oauth_flow
 
     settings = load_settings()
+    if settings.drive.get("mode") == "public_folder":
+        print("drive.mode = 'public_folder': no Google credentials are needed —")
+        print("sync_cvs downloads from the shared folder anonymously (read-only).")
+        return 0
     try:
         token = run_oauth_flow(settings)
         print(f"OAuth token saved: {token}")

@@ -53,8 +53,9 @@ record_application ──► SQLite memory: never apply to the same job twice
 - **Application memory** — SQLite-backed history; searches mark
   `already_applied`; `start_application` refuses duplicates; `check_applied`
   matches by URL or fuzzy title+company across boards.
-- **CV management** — local CV folder + two-way Google Drive sync. CVs are
-  parsed, domain-tagged and matched to vacancies; edits flow back to Drive.
+- **CV management** — local CV folder + Google Drive sync. A shared-by-link
+  public folder syncs anonymously and read-only (no credentials at all);
+  private OAuth/service-account folders also support pushing edits back.
 - **Agent-optimized browser** — persistent login profile (real Edge by
   default), Google SSO walkthrough, every action returns a fresh snapshot,
   application forms with human-readable field labels, apply-wizard isolation
@@ -89,7 +90,9 @@ uv run work-researcher serve --transport stdio
    (right-to-work, date of birth, etc. — boards ask these on apply).
 2. Free API keys (optional but recommended): Adzuna, Reed, Jooble —
    see `SETUP.md`.
-3. Google Drive CV sync (optional): one-time OAuth setup in `SETUP.md`.
+3. Google Drive CV sync (optional): a shared-by-link public folder needs no
+   setup at all (`drive.mode = "public_folder"`); private folders need the
+   one-time OAuth/service-account setup in `SETUP.md`.
 4. Connect to your MCP host with the stdio command:
 
 ```
@@ -131,7 +134,7 @@ src/work_researcher/
                    earthworks govuk_workhub       dedup.py      cross-board duplicate merge
   persistence.py   SQLite (jobs/searches/apps/    geo.py        geocoding + work-mode commute policy
                    cvs/blocklist/locations)       cvmanager.py  CV parse + domain tagging + matching
-  drive.py         Google Drive read/write        requirements.py  hard-requirements extraction/matching
+  drive.py         Google Drive sync (public read-only / OAuth / service account)  requirements.py  hard-requirements extraction/matching
   ranking.py       relevance scoring              training.py   paid-course-ad detection
   seller.py        agency vs employer             config.py     config.toml + env
 ```

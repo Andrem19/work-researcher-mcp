@@ -1,8 +1,12 @@
-"""Google Drive sync for the CV folder (account ry4ara@gmail.com, folder "CV").
+"""Google Drive sync for the CV folder.
 
-Read AND write: CVs are pulled into CV_collection for editing (docx via
-python-docx) and pushed back with push_cv/upload_cv. Two auth modes:
+Three modes:
 
+- public_folder: anonymous, read-only download from a shared-by-link public
+  folder. No Google credentials of any kind — the config names the folder
+  (URL or id) and that value is not a secret. `push_cv_to_drive` fails closed
+  in this mode: the bot only ever downloads. This is the Remtz Hub mode
+  (ENG-269): the CV folder is shared "anyone with the link".
 - oauth: Google Cloud OAuth client (Desktop app) → secrets/google_credentials.json,
   one-time browser consent cached in secrets/google_token.json
   (`work-researcher drive-auth` runs the flow).
@@ -17,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import io
+import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import Settings
@@ -34,6 +40,223 @@ GDOC_EXPORT = (
 
 class DriveNotConfigured(RuntimeError):
     pass
+
+
+class DriveReadOnly(RuntimeError):
+    """Raised when a write is attempted in the public read-only mode."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "public_folder mode is read-only: the bot downloads CVs and never "
+            "writes to Drive — edit the file in Google Drive instead"
+        )
+
+
+FOLDER_PAGE_URL = "https://drive.google.com/drive/folders/"
+DOWNLOAD_URL = "https://drive.usercontent.google.com/download"
+_USER_AGENT = "work-researcher-mcp (public CV sync)"
+
+# One file row of the folder page's embedded `_DRIVE_ivd` array, decoded:
+# ["<id>",["<parent>"]," <name>"," <mime>", <n>, null, <n>, <n>, <n>,
+#  <created_ms>, <modified_ms>, null, null, <size>, [[...
+_ROW = re.compile(
+    r'\["(?P<id>[-A-Za-z0-9_]{20,})",'  # file id
+    r'\["[-A-Za-z0-9_]{20,}"\],'  # parent folder id
+    r'"(?P<name>.*?)",'  # file name; lazy — an embedded quote resolves by backtracking
+    r'"(?P<mime>[^"]*)"'  # mime type
+    r'(?:,\d+,null,\d+,\d+,\d+,(?P<created>\d{12,}),(?P<modified>\d{12,}),null,null,'
+    r'(?P<size>\d+),\[\[)?'  # the numeric tail is optional per row
+    ,
+    re.S,  # the decoded blob is one long line; a lazy name must be able to span it
+)
+
+_JS_ESCAPE = re.compile(r"\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)", re.S)
+
+
+def _unescape_js(blob: str) -> str:
+    r"""Decode the JS string escapes (hex, unicode, \n, backslash, quote) the
+    folder page wraps its listing data in."""
+
+    def one(match: re.Match[str]) -> str:
+        esc = match.group(1)
+        if esc[0] in "xu":
+            return chr(int(esc[1:], 16))
+        return {"n": "\n", "t": "\t", "r": "\r"}.get(esc, esc)
+
+    return _JS_ESCAPE.sub(one, blob)
+
+
+def _client(timeout_s: float):
+    """One HTTP client per operation. Tests substitute a MockTransport here."""
+    import httpx
+
+    return httpx.Client(
+        timeout=timeout_s,
+        follow_redirects=True,
+        headers={"user-agent": _USER_AGENT},
+    )
+
+
+def public_folder_id(settings: Settings) -> str | None:
+    """The public folder's id, from `folder_id` or parsed from `folder_url`."""
+    fid = str(settings.drive.get("folder_id") or "").strip()
+    if fid:
+        return fid
+    url = str(settings.drive.get("folder_url") or "").strip()
+    if not url:
+        return None
+    match = re.search(r"/folders/([-A-Za-z0-9_]{10,})", url) or re.search(
+        r"[?&]id=([-A-Za-z0-9_]{10,})", url
+    )
+    return match.group(1) if match else None
+
+
+def _extract_ivd_blob(html: str) -> str | None:
+    """The escaped data string the folder page assigns to `_DRIVE_ivd`.
+
+    Character-level scan (a backslash always escapes the next character), so
+    Google's quoted-`'`-inside-the-data tricks cannot truncate the blob.
+    """
+    i = html.find("_DRIVE_ivd")
+    while i != -1:
+        eq = html.find("= '", i)
+        if eq == -1:
+            return None
+        j = eq + 3
+        out: list[str] = []
+        while j < len(html):
+            ch = html[j]
+            if ch == "\\":
+                out.append(html[j : j + 2])
+                j += 2
+                continue
+            if ch == "'":
+                break
+            out.append(ch)
+            j += 1
+        blob = "".join(out)
+        if len(blob) > 50:
+            return blob
+        i = html.find("_DRIVE_ivd", i + 1)
+    return None
+
+
+def _parse_folder_listing(html: str) -> list[dict]:
+    """File entries embedded in the anonymous folder page.
+
+    The page serialises the listing as escaped JS; rows carry id, parent, name,
+    mime and (when the row is complete) created/modified epoch-ms and size.
+    The folder owner's own layout may evolve, so anything this parser cannot
+    confidently read is left out and the caller reports the honest count.
+    """
+    files: list[dict] = []
+    seen: set[str] = set()
+    blob = _extract_ivd_blob(html)
+    if blob is None:
+        return files
+    decoded = _unescape_js(blob)
+    for row in _ROW.finditer(decoded):
+        fid = row.group("id")
+        if fid in seen:
+            continue
+        seen.add(fid)
+        entry: dict = {
+            "id": fid,
+            "name": row.group("name"),
+            "mimeType": row.group("mime"),
+        }
+        if row.group("modified"):
+            entry["modifiedTime"] = datetime.fromtimestamp(
+                int(row.group("modified")) / 1000, tz=UTC
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if row.group("size"):
+            entry["size"] = row.group("size")
+        files.append(entry)
+    return files
+
+
+def _public_list_sync(settings: Settings, timeout_s: float = 30.0) -> dict:
+    folder_id = public_folder_id(settings)
+    if not folder_id:
+        return {
+            "ok": False,
+            "error": "public_folder mode needs the shared folder: set drive.folder_url "
+            "(the 'anyone with the link' URL) or drive.folder_id in config.toml",
+        }
+    with _client(timeout_s) as client:
+        try:
+            resp = client.get(f"{FOLDER_PAGE_URL}{folder_id}")
+        except Exception as exc:  # noqa: BLE001 - network failure is a fact, not a crash
+            return {"ok": False, "error": f"folder page unreachable: {type(exc).__name__}: {exc}"}
+    if resp.status_code != 200:
+        return {
+            "ok": False,
+            "error": f"folder page answered {resp.status_code} for folder {folder_id} "
+            "(is the link shared 'anyone with the link'?)",
+        }
+    files = _parse_folder_listing(resp.text)
+    if not files:
+        return {
+            "ok": False,
+            "error": "the public folder page named no files — the listing layout "
+            "may have changed or the folder is empty",
+        }
+    return {
+        "ok": True,
+        "folder": {"id": folder_id, "name": settings.drive.get("folder_name", "CV")},
+        "files": files,
+    }
+
+
+def _public_download_sync(
+    settings: Settings, file_meta: dict, timeout_s: float = 60.0
+) -> tuple[Path, bool]:
+    """Download one public file; unchanged content is detected by sha256."""
+    import hashlib
+
+    file_id = file_meta["id"]
+    name = file_meta["name"]
+    if not name or Path(name).name in {"", ".", ".."}:
+        raise RuntimeError(f"the listing carries an unusable file name: {name!r}")
+    target = settings.cv_dir / Path(name).name
+    params: dict = {"id": file_id, "export": "download", "confirm": "t"}
+    with _client(timeout_s) as client:
+        resp = client.get(DOWNLOAD_URL, params=params)
+        if resp.status_code != 200:
+            raise RuntimeError(f"download answered HTTP {resp.status_code}")
+        if resp.headers.get("content-type", "").startswith("text/"):
+            # Google's download-confirmation interstitial: re-ask with its form fields.
+            extra = {
+                key: value
+                for key, value in re.findall(
+                    r'name="(\w+)"\s+value="([^"]*)"', resp.text
+                )
+            }
+            if not extra:
+                raise RuntimeError(
+                    "download returned an HTML interstitial with no confirmation form"
+                )
+            resp = client.get(DOWNLOAD_URL, params={**params, **extra})
+            if resp.status_code != 200:
+                raise RuntimeError(f"download answered HTTP {resp.status_code} after confirm")
+        if "text/html" in resp.headers.get("content-type", ""):
+            # A second interstitial (captcha, rate-limit page) must never be
+            # written as a CV: hash-detection would otherwise pin the garbage
+            # in place as "unchanged" on every later sync.
+            raise RuntimeError("download returned an HTML page instead of the file")
+        data = resp.content
+    if not data:
+        raise RuntimeError("download returned an empty body")
+    digest = hashlib.sha256(data).hexdigest()
+    if target.exists():
+        existing = hashlib.sha256(target.read_bytes()).hexdigest()
+        if existing == digest:
+            return target, False  # unchanged
+    settings.cv_dir.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".part")
+    tmp.write_bytes(data)
+    tmp.replace(target)
+    return target, True
 
 
 def _creds_path(settings: Settings, key: str) -> Path:
@@ -114,7 +337,13 @@ def _find_folder(service, settings: Settings) -> dict | None:
     return files[0] if files else None
 
 
+def _is_public(settings: Settings) -> bool:
+    return settings.drive.get("mode") == "public_folder"
+
+
 def _list_files_sync(settings: Settings) -> dict:
+    if _is_public(settings):
+        return _public_list_sync(settings)
     service = build_service(settings)
     folder = _find_folder(service, settings)
     if folder is None:
@@ -220,6 +449,8 @@ async def upload_cv(settings: Settings, path: str | Path,
     inside the CV folder. Refuses to overwrite when the Drive copy is newer
     than our last sync (unless force) — pull first, merge, then push.
     """
+    if _is_public(settings):
+        raise DriveReadOnly()
     from . import persistence as db
 
     p = Path(path)
@@ -278,6 +509,18 @@ async def status(settings: Settings) -> dict:
     if not settings.drive.get("enabled", True) or mode == "off":
         return {"enabled": False, "configured": False,
                 "note": "Drive sync disabled in config.toml"}
+    if mode == "public_folder":
+        fid = public_folder_id(settings)
+        return {
+            "enabled": True,
+            "configured": fid is not None,
+            "mode": mode,
+            "folder_id": fid,
+            "read_only": True,
+            "note": "public shared folder: sync_cvs downloads anonymously; "
+            "push_cv_to_drive is not supported",
+            **({} if fid else {"setup_needed": "set drive.folder_url or drive.folder_id in config.toml"}),
+        }
     try:
         await asyncio.to_thread(build_service, settings)
         return {"enabled": True, "configured": True, "mode": mode,
@@ -303,16 +546,30 @@ async def sync(settings: Settings) -> dict:
     listing = await list_files(settings)
     if not listing.get("ok"):
         return listing
-    supported = [f for f in listing["files"]
-                 if f.get("mimeType") in CV_MIMES
-                 or f.get("mimeType") == "application/vnd.google-apps.document"
-                 or Path(f["name"]).suffix.lower() in {".docx", ".pdf", ".doc"}]
+    public = _is_public(settings)
     downloaded, unchanged, skipped = [], [], []
+    supported = []
+    for entry in listing["files"]:
+        if (entry.get("mimeType") in CV_MIMES
+                or entry.get("mimeType") == "application/vnd.google-apps.document"
+                or Path(entry["name"]).suffix.lower() in {".docx", ".pdf", ".doc"}):
+            supported.append(entry)
+        else:
+            # A file the CV parser cannot use is reported, not silently dropped:
+            # the owner sees the folder's real contents versus what landed locally.
+            skipped.append(
+                f"{entry['name']}: unsupported type ({entry.get('mimeType') or 'unknown'})"
+            )
     meta_by_name: dict[str, dict] = {}
     async with db.connect(settings.db_path) as conn:
         for meta in supported:
             try:
-                target, changed = await asyncio.to_thread(_download_sync, settings, meta)
+                if public:
+                    target, changed = await asyncio.to_thread(
+                        _public_download_sync, settings, meta
+                    )
+                else:
+                    target, changed = await asyncio.to_thread(_download_sync, settings, meta)
                 (downloaded if changed else unchanged).append(target.name)
                 meta_by_name[target.name] = meta
             except Exception as exc:  # noqa: BLE001

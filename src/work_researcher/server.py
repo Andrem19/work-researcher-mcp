@@ -918,9 +918,11 @@ def _register_tools(mcp: MCPServer, settings: Settings) -> None:
     @mcp.tool()
     async def sync_cvs(source: str = "both", force: bool = False) -> dict:
         """Refresh the CV index. source: 'local' (scan CV_collection),
-        'drive' (pull new/changed files from Google Drive folder 'CV' on
-        ry4ara@gmail.com, then index), 'both' (default). Drive needs one-time
-        credentials (see SETUP.md) — returns setup_needed otherwise."""
+        'drive' (pull new/changed files from the configured Drive folder, then
+        index), 'both' (default). Drive auth depends on drive.mode: with the
+        'public_folder' mode the folder is shared by link and sync is
+        anonymous read-only (no credentials); 'oauth' / 'service_account' need
+        one-time setup (see SETUP.md) and answer setup_needed otherwise."""
         results: dict[str, Any] = {}
         if source in ("drive", "both"):
             results["drive"] = await drive_mod.sync(settings)
@@ -933,7 +935,10 @@ def _register_tools(mcp: MCPServer, settings: Settings) -> None:
         """Push a locally edited CV back to Google Drive (update known file or
         create in the CV folder). Edit loop: edit docx in CV_collection →
         sync_cvs(source='local') → push_cv_to_drive. Refuses to overwrite when
-        the Drive copy changed after our last pull (force to override)."""
+        the Drive copy changed after our last pull (force to override).
+        Not available in the read-only 'public_folder' drive mode: the bot
+        downloads CVs and never writes to Drive — edit the file in Google
+        Drive directly."""
         return await drive_mod.upload_cv(settings, path, force=force)
 
     # ------------------------------------------------------------- apply ----
